@@ -4,13 +4,13 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ollama import AsyncClient
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, Horizontal
 from textual.widgets import Footer, Header, Input, RichLog, Static
-
+from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # Agent tools
@@ -42,10 +42,63 @@ def read_file(fileName: str) -> str:
 
 
 def write_file(fileName: str, content: str) -> str:
+
     path = _safe_path(fileName)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return f"wrote {len(content)} chars to '{fileName}'"
+
+
+def edit_text(
+    file_name: str,
+    target: str,
+    content: str,
+    mode: Literal["replace", "before", "after"] = "replace",
+) -> str:
+    path = _safe_path(file_name)
+
+    if not path.exists():
+        raise FileNotFoundError(file_name)
+
+    text = path.read_text(encoding="utf-8")
+
+    if target not in text:
+        raise ValueError("Target text not found.")
+
+    if mode == "replace":
+        updated = text.replace(target, content, 1)
+
+    elif mode == "before":
+        updated = text.replace(target, content + target, 1)
+
+    elif mode == "after":
+        updated = text.replace(target, target + content, 1)
+
+    else:
+        raise ValueError(f"Unknown edit mode: {mode}")
+
+    path.write_text(updated, encoding="utf-8")
+
+    return "Edited successfully."
+
+
+
+def replace_text(file_name: str, old: str, new: str) -> str:
+    path = _safe_path(file_name)
+
+    if not path.exists():
+        raise FileNotFoundError(file_name)
+
+    text = path.read_text(encoding="utf-8")
+
+    if old not in text:
+        raise ValueError("Target text not found.")
+
+    updated = text.replace(old, new, 1)
+
+    path.write_text(updated, encoding="utf-8")
+    return "Edited successfully."
+
 
 
 def get_project_context(fileName: str = "") -> str:
@@ -75,7 +128,8 @@ TOOL_IMPL = {
     "ReadFiles": lambda args: read_file(args["fileName"]),
     "WriteInFiles": lambda args: write_file(args["fileName"], args.get("content", "")),
     "GetProjectContext": lambda args: get_project_context(args.get("fileName", "")),
-}
+    "EditFile": lambda args: edit_text(args["fileName"], args["target"], args["newText"], args["mode"]),
+    }
 
 TOOLS = [
     {
@@ -136,7 +190,50 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "EditText",
+            "description": (
+                "Edit an existing file by replacing text or inserting new text "
+                "before or after a target string. The target must exist in the file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fileName": {
+                        "type": "string",
+                        "description": "Path to the file, relative to the project root.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "The existing text to search for in the file.",
+                    },
+                    "newText": {
+                        "type": "string",
+                        "description": (
+                            "The text to insert or use as the replacement."
+                        ),
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "before", "after"],
+                        "description": (
+                            "How to apply the edit. "
+                            "'replace' replaces the target with newText. "
+                            "'before' inserts newText immediately before the target. "
+                            "'after' inserts newText immediately after the target."
+                        ),
+                    },
+                },
+                "required": ["fileName", "target", "newText", "mode"],
+            },
+        },
+    },
 ]
+
+
+
 
 SYSTEM_PROMPT = f"""You are Pulonia, a coding agent running locally against project files.
 
