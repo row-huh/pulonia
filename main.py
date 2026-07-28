@@ -7,21 +7,46 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ollama import AsyncClient
-from textual.app import App, ComposeResult
-from textual.containers import Vertical, Horizontal
-from textual.widgets import Footer, Header, Input, RichLog, Static
 from pydantic import BaseModel
+from textual.app import App, ComposeResult
+from textual.containers import Center, Horizontal, Vertical
+from textual.events import Resize
+from textual.widgets import Footer, Header, Input, OptionList, RichLog, Static
+from textual.widgets.option_list import Option
+
+# Pillow & textual-imageview support for image rendering in terminal
+from PIL import Image as PILImage
+
+try:
+    from textual_imageview.widgets import ImageView
+
+    HAS_IMAGE_VIEW = True
+except ImportError:
+    HAS_IMAGE_VIEW = False
+
+# ---------------------------------------------------------------------------
+# Responsive ASCII Art Banners
+# ---------------------------------------------------------------------------
+
+BIG_ASCII = r"""
+  _____       _             _          _____          _      
+ |  __ \     | |           (_)        / ____|        | |     
+ | |__) |   _| | ___  _ __  _  __ _  | |     ___   __| | ___ 
+ |  ___/ | | | |/ _ \| '_ \| |/ _` | | |    / _ \ / _` |/ _ \
+ | |   | |_| | | (_) | | | | | (_| | | |___| (_) | (_| |  __/
+ |_|    \__,_|_|\___/|_| |_|_|\__,_|  \_____\___/ \__,_|\___|
+"""
+
 
 # ---------------------------------------------------------------------------
 # Agent tools
-#
-# All tools are sandboxed to AGENT_WORKDIR (default: current directory) so a
-# model can never read/write outside the project folder, even if it tries a
-# path like "../../etc/passwd".
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(os.getenv("AGENT_WORKDIR", ".")).resolve()
-MAX_TOOL_TURNS = 6  # hard cap so a tool-call loop can't run forever
+# Directory the script itself lives in — used for locating bundled assets
+# like pulonia.png, independent of whatever cwd the user launches from.
+SCRIPT_DIR = Path(__file__).resolve().parent
+MAX_TOOL_TURNS = 6
 
 
 def _safe_path(file_name: str) -> Path:
@@ -42,7 +67,6 @@ def read_file(fileName: str) -> str:
 
 
 def write_file(fileName: str, content: str) -> str:
-
     path = _safe_path(fileName)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -67,20 +91,15 @@ def edit_text(
 
     if mode == "replace":
         updated = text.replace(target, content, 1)
-
     elif mode == "before":
         updated = text.replace(target, content + target, 1)
-
     elif mode == "after":
         updated = text.replace(target, target + content, 1)
-
     else:
         raise ValueError(f"Unknown edit mode: {mode}")
 
     path.write_text(updated, encoding="utf-8")
-
     return "Edited successfully."
-
 
 
 def replace_text(file_name: str, old: str, new: str) -> str:
@@ -95,15 +114,11 @@ def replace_text(file_name: str, old: str, new: str) -> str:
         raise ValueError("Target text not found.")
 
     updated = text.replace(old, new, 1)
-
     path.write_text(updated, encoding="utf-8")
     return "Edited successfully."
 
 
-
 def get_project_context(fileName: str = "") -> str:
-    """Lightweight project map: directory tree plus, if fileName is given,
-    a peek at that file's neighbors (siblings in the same directory)."""
     lines: list[str] = []
     for path in sorted(BASE_DIR.rglob("*")):
         if any(part.startswith(".") for part in path.relative_to(BASE_DIR).parts):
@@ -128,8 +143,10 @@ TOOL_IMPL = {
     "ReadFiles": lambda args: read_file(args["fileName"]),
     "WriteInFiles": lambda args: write_file(args["fileName"], args.get("content", "")),
     "GetProjectContext": lambda args: get_project_context(args.get("fileName", "")),
-    "EditFile": lambda args: edit_text(args["fileName"], args["target"], args["newText"], args["mode"]),
-    }
+    "EditFile": lambda args: edit_text(
+        args["fileName"], args["target"], args["newText"], args["mode"]
+    ),
+}
 
 TOOLS = [
     {
@@ -211,19 +228,12 @@ TOOLS = [
                     },
                     "newText": {
                         "type": "string",
-                        "description": (
-                            "The text to insert or use as the replacement."
-                        ),
+                        "description": "The text to insert or use as the replacement.",
                     },
                     "mode": {
                         "type": "string",
                         "enum": ["replace", "before", "after"],
-                        "description": (
-                            "How to apply the edit. "
-                            "'replace' replaces the target with newText. "
-                            "'before' inserts newText immediately before the target. "
-                            "'after' inserts newText immediately after the target."
-                        ),
+                        "description": "How to apply the edit.",
                     },
                 },
                 "required": ["fileName", "target", "newText", "mode"],
@@ -231,9 +241,6 @@ TOOLS = [
         },
     },
 ]
-
-
-
 
 SYSTEM_PROMPT = f"""You are Pulonia, a coding agent running locally against project files.
 
@@ -259,7 +266,6 @@ Guidelines:
 
 
 def extract_chunk_content(chunk: Any) -> str:
-    """Extract streamed text from an Ollama chat chunk."""
     if isinstance(chunk, dict):
         message = chunk.get("message") or {}
         return message.get("content", "") or ""
@@ -272,7 +278,6 @@ def extract_chunk_content(chunk: Any) -> str:
 
 
 def extract_tool_calls(chunk: Any) -> list[Any]:
-    """Extract tool_calls from an Ollama chat chunk, if any."""
     if isinstance(chunk, dict):
         message = chunk.get("message") or {}
         return message.get("tool_calls") or []
@@ -288,12 +293,46 @@ SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 
 
 class Pulonia(App):
-    """Minimal Textual chat UI that streams Ollama responses, with file tools."""
+    """Minimal Textual chat UI: centered hero (image + ascii + input) on landing,
+    switches to full chat workspace once the first message is sent."""
 
     CSS = """
     Screen {
         layout: vertical;
         background: $surface;
+    }
+
+    /* Landing Container */
+    #landing_container {
+        width: 100%;
+        height: 1fr;
+        align: center middle;
+    }
+
+    #hero_box {
+        width: auto;
+        height: auto;
+        align: center middle;
+    }
+
+    #hero_image {
+        width: 40;
+        height: 15;
+        margin-bottom: 1;
+    }
+
+    #hero_fallback {
+        width: 100%;
+        text-align: center;
+        color: $accent;
+        margin-bottom: 1;
+    }
+
+    /* Active Chat Container (hidden at start) */
+    #chat_container {
+        display: none;
+        height: 1fr;
+        layout: vertical;
     }
 
     #messages {
@@ -333,13 +372,25 @@ class Pulonia(App):
         text-style: bold;
     }
 
+    /* Input: centered/inline while on the landing hero, docked once chat starts */
     #input {
-        dock: bottom;
+        width: 60;
         border: round $primary;
+        margin-top: 1;
+    }
+
+    #input.docked {
+        dock: bottom;
+        width: 100%;
+        margin-top: 0;
     }
 
     #input:focus {
         border: round $accent;
+    }
+
+    #autocomplete {
+        display: none;
     }
     """
 
@@ -347,6 +398,12 @@ class Pulonia(App):
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_chat", "Clear"),
     ]
+
+    COMMANDS = {
+        "/model": "Switch or view Ollama models",
+        "/clear": "Clear current chat history",
+        "/session": "View cached chat sessions",
+    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -366,20 +423,60 @@ class Pulonia(App):
         self._spinner_timer = None
         self._spinner_frame = 0
         self._request_start: float = 0.0
+        self._has_started_chat = False
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Vertical():
+
+        # 1. Centered Hero Landing Screen — image + ascii text + input, stacked
+        #    together as one centered block (not either/or, both together).
+        with Center(id="landing_container"):
+            with Vertical(id="hero_box"):
+                # Resolve against the script's own directory, not cwd — this was
+                # the actual reason pulonia.png silently failed to load before.
+                image_path = SCRIPT_DIR / "pulonia.png"
+                if HAS_IMAGE_VIEW and image_path.exists():
+                    try:
+                        pil_img = PILImage.open(image_path)
+                        yield ImageView(pil_img, id="hero_image")
+                    except Exception as exc:
+                        yield Static(
+                            f"[dim red](image failed to load: {exc})[/]",
+                            id="hero_image_error",
+                        )
+                elif not HAS_IMAGE_VIEW:
+                    yield Static(
+                        "[dim](textual-imageview not installed — pip install textual-imageview)[/]",
+                        id="hero_image_error",
+                    )
+                elif not image_path.exists():
+                    yield Static(
+                        f"[dim](pulonia.png not found at {image_path})[/]",
+                        id="hero_image_error",
+                    )
+
+                yield Static(f"[bold magenta]{BIG_ASCII}[/]", id="hero_fallback")
+
+                yield Input(
+                    placeholder="Ask Pulonia something or type / for commands...",
+                    id="input",
+                )
+
+        # 2. Main Chat Workspace Screen (Hidden initially)
+        with Vertical(id="chat_container"):
             messages = RichLog(id="messages", wrap=True, highlight=False, markup=True)
             messages.border_title = "Chat"
             yield messages
+
             stream = Static("", id="stream")
             stream.border_title = "Live"
             yield stream
+
             with Horizontal(id="status_bar"):
                 yield Static("Ready", id="status")
                 yield Static("", id="timer")
-            yield Input(placeholder="Type a message and press Enter", id="input")
+
+        yield OptionList(id="autocomplete")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -389,8 +486,41 @@ class Pulonia(App):
         self._status_widget = self.query_one("#status", Static)
         self._timer_widget = self.query_one("#timer", Static)
         self._input_widget.focus()
+
         self._messages_widget.write(f"[bold cyan]Model:[/] {self.model}")
         self._messages_widget.write(f"[bold cyan]Project root:[/] {BASE_DIR}")
+        self._update_ascii_art(self.size.width)
+
+    def on_resize(self, event: Resize) -> None:
+        """Dynamically adapts the ASCII banner according to terminal width."""
+        self._update_ascii_art(event.size.width)
+
+    def _update_ascii_art(self, width: int) -> None:
+        try:
+            fallback_widget = self.query_one("#hero_fallback", Static)
+        except Exception:
+            return
+
+
+        fallback_widget.update(f"[bold magenta]{BIG_ASCII}[/]")
+
+    async def _switch_to_chat_view(self) -> None:
+        """Transitions the UI from the central hero view to the chat interface,
+        re-parenting the single Input widget from the hero block down to a
+        bottom-docked position."""
+        if self._has_started_chat:
+            return
+
+        self.query_one("#landing_container").styles.display = "none"
+        self.query_one("#chat_container").styles.display = "block"
+
+        assert self._input_widget is not None
+        await self._input_widget.remove()
+        await self.mount(self._input_widget)
+        self._input_widget.add_class("docked")
+        self._input_widget.focus()
+
+        self._has_started_chat = True
 
     def action_clear_chat(self) -> None:
         self.messages = [self.messages[0]]
@@ -417,6 +547,64 @@ class Pulonia(App):
         if self._timer_widget is not None:
             self._timer_widget.update(f"{elapsed:0.1f}s")
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        value = event.value
+        autocomplete = self.query_one("#autocomplete", OptionList)
+
+        if value.startswith("/"):
+            query = value.lower()
+            matches = [
+                (cmd, desc)
+                for cmd, desc in self.COMMANDS.items()
+                if cmd.lower().startswith(query)
+            ]
+
+            if matches:
+                autocomplete.clear_options()
+                for cmd, desc in matches:
+                    autocomplete.add_option(
+                        Option(f"[bold cyan]{cmd}[/] [dim]- {desc}[/]", id=cmd)
+                    )
+                autocomplete.display = True
+                return
+
+        autocomplete.display = False
+
+    def on_key(self, event) -> None:
+        autocomplete = self.query_one("#autocomplete", OptionList)
+
+        if autocomplete.display:
+            if event.key == "down":
+                autocomplete.action_cursor_down()
+                event.prevent_default()
+            elif event.key == "up":
+                autocomplete.action_cursor_up()
+                event.prevent_default()
+            elif event.key == "tab" or (
+                event.key == "enter" and autocomplete.highlighted is not None
+            ):
+                if autocomplete.highlighted_at is not None:
+                    option = autocomplete.get_option_at_index(
+                        autocomplete.highlighted_at
+                    )
+                    if option and option.id:
+                        input_widget = self.query_one("#input", Input)
+                        input_widget.value = f"{option.id} "
+                        input_widget.cursor_position = len(input_widget.value)
+                        autocomplete.display = False
+                        event.prevent_default()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        input_widget = self.query_one("#input", Input)
+        autocomplete = self.query_one("#autocomplete", OptionList)
+
+        if event.option.id:
+            input_widget.value = f"{event.option.id} "
+            input_widget.focus()
+            input_widget.cursor_position = len(input_widget.value)
+
+        autocomplete.display = False
+
     def _start_spinner(self) -> None:
         self._spinner_frame = 0
         self._request_start = time.perf_counter()
@@ -428,7 +616,6 @@ class Pulonia(App):
             self._spinner_timer = None
 
     def _run_tool_call(self, tool_call: Any) -> dict[str, Any]:
-        """Execute one tool call and return a `role: tool` message for it."""
         if isinstance(tool_call, dict):
             fn = tool_call.get("function", {})
             name = fn.get("name", "")
@@ -446,22 +633,102 @@ class Pulonia(App):
         else:
             try:
                 result = impl(args)
-            except Exception as exc:  # noqa: BLE001 - surface any tool error to the model
+            except Exception as exc:
                 result = f"error running {name}: {exc}"
 
-        self._messages_widget.write(f"[dim]→ {name}({args}) => {str(result)[:200]}[/]")
+        if self._messages_widget:
+            self._messages_widget.write(
+                f"[dim]→ {name}({args}) => {str(result)[:200]}[/]"
+            )
         return {"role": "tool", "name": name, "content": str(result)}
+
+    async def _handle_command(self, raw: str) -> None:
+        parts = raw[1:].split(maxsplit=1)
+        cmd = parts[0].lower() if parts else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd == "model":
+            await self._cmd_model(arg)
+        elif cmd == "clear":
+            self.action_clear_chat()
+        else:
+            if self._messages_widget:
+                self._messages_widget.write(f"[bold yellow]unknown command: /{cmd}[/]")
+
+    async def _cmd_model(self, arg: str) -> None:
+        try:
+            resp = await self._ollama.list()
+        except Exception as exc:
+            if self._messages_widget:
+                self._messages_widget.write(
+                    f"[bold red]could not list models: {exc}[/]"
+                )
+            return
+
+        raw_models = (
+            resp.get("models")
+            if isinstance(resp, dict)
+            else getattr(resp, "models", [])
+        )
+        names = [
+            m.get("model") if isinstance(m, dict) else getattr(m, "model", None)
+            for m in raw_models
+            if m
+        ]
+        names = [n for n in names if n]
+
+        if not names:
+            if self._messages_widget:
+                self._messages_widget.write("[bold yellow]no local models found[/]")
+            return
+
+        if not arg:
+            lines = [
+                f"  [{i}] {n}" + ("  [dim](current)[/]" if n == self.model else "")
+                for i, n in enumerate(names)
+            ]
+            if self._messages_widget:
+                self._messages_widget.write(
+                    "[bold cyan]local models:[/]\n" + "\n".join(lines)
+                )
+                self._messages_widget.write("[dim]/model <number|name> to switch[/]")
+            return
+
+        picked = None
+        if arg.isdigit() and 0 <= int(arg) < len(names):
+            picked = names[int(arg)]
+        else:
+            matches = [n for n in names if n == arg or n.startswith(arg)]
+            if matches:
+                picked = matches[0]
+
+        if picked is None:
+            if self._messages_widget:
+                self._messages_widget.write(f"[bold red]no match for '{arg}'[/]")
+            return
+
+        self.model = picked
+        if self._messages_widget:
+            self._messages_widget.write(f"[bold green]switched model →[/] {picked}")
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
         if not prompt:
             return
 
+        event.input.value = ""
+
+        # Transition layout from landing hero to full chat interface
+        await self._switch_to_chat_view()
+
+        if prompt.startswith("/"):
+            await self._handle_command(prompt)
+            return
+
         assert self._messages_widget is not None
         assert self._stream_widget is not None
         assert self._input_widget is not None
 
-        event.input.value = ""
         self._input_widget.disabled = True
         self._messages_widget.write(f"\n[bold green]You:[/] {prompt}")
         self.messages.append({"role": "user", "content": prompt})
@@ -500,8 +767,6 @@ class Pulonia(App):
                 answer = "".join(chunks).strip()
 
                 if pending_tool_calls:
-                    # Record the assistant's tool-call turn, then run each tool
-                    # and feed results back for the next iteration.
                     self.messages.append(
                         {
                             "role": "assistant",
@@ -512,18 +777,12 @@ class Pulonia(App):
                     self._set_status(f"running {len(pending_tool_calls)} tool(s)...")
                     for tool_call in pending_tool_calls:
                         self.messages.append(self._run_tool_call(tool_call))
-                    continue  # loop back into the model with tool results
+                    continue
 
-                # No tool calls: this is the final answer for this turn.
                 if answer:
                     self.messages.append({"role": "assistant", "content": answer})
                 break
             else:
-                self._stream_widget.update(
-                    self._stream_widget.renderable
-                    if hasattr(self._stream_widget, "renderable")
-                    else ""
-                )
                 self._messages_widget.write(
                     "[bold yellow]⚠ hit max tool-call turns without a final answer[/]"
                 )
