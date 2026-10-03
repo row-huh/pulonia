@@ -29,12 +29,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 BIG_ASCII = r"""
-  _____       _             _          _____          _      
- |  __ \     | |           (_)        / ____|        | |     
- | |__) |   _| | ___  _ __  _  __ _  | |     ___   __| | ___ 
- |  ___/ | | | |/ _ \| '_ \| |/ _` | | |    / _ \ / _` |/ _ \
- | |   | |_| | | (_) | | | | | (_| | | |___| (_) | (_| |  __/
- |_|    \__,_|_|\___/|_| |_|_|\__,_|  \_____\___/ \__,_|\___|
+ _____   ____    _____   _____     ____    _____   _   _   _
+|  ___| |  _ \  |  ___| |  ___|   |  _ \  |  ___| (_) | \  | |
+| |_    | |_) | | |__   | |__     | |_) | | |__   | | |  \ | |
+|  _|   |  _ <  |  __|  |  __|    |  _ <  |  __|  | | | |\ | |
+| |     | |_) | | |___  | |___    | |_) | | |___  | | | | \| |
+|_|     |____/  |_____| |_____|   |____/  |_____| |_| |_|  \_|
 """
 
 
@@ -139,11 +139,13 @@ def get_project_context(fileName: str = "") -> str:
     return f"{tree}\n\n--- siblings of {fileName} ---\n" + "\n".join(siblings)
 
 
+# NOTE: keys must match the "name" fields in TOOLS below (EditFile -> EditText
+# was a mismatch before, so edit calls always came back as "unknown tool").
 TOOL_IMPL = {
     "ReadFiles": lambda args: read_file(args["fileName"]),
     "WriteInFiles": lambda args: write_file(args["fileName"], args.get("content", "")),
     "GetProjectContext": lambda args: get_project_context(args.get("fileName", "")),
-    "EditFile": lambda args: edit_text(
+    "EditText": lambda args: edit_text(
         args["fileName"], args["target"], args["newText"], args["mode"]
     ),
 }
@@ -242,23 +244,44 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = f"""You are Pulonia, a coding agent running locally against project files.
+# ---------------------------------------------------------------------------
+# Nimble: small Ollama model that picks the tool for each step.
+# The main model is then only shown that one tool (or none).
+# ---------------------------------------------------------------------------
+
+TOOL_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
+
+# Constrained decoding: nimble can only emit a real tool name or "none".
+PICK_SCHEMA = {
+    "type": "object",
+    "properties": {"tool": {"type": "string", "enum": [*TOOL_BY_NAME, "none"]}},
+    "required": ["tool"],
+}
+
+ROUTER_PROMPT = (
+    "You are a tool router for a coding agent. Given the user's request and the "
+    "tool results so far, pick the ONE tool needed for the next step. If the "
+    "request can be answered now without any tool, pick 'none'. "
+    'Reply with JSON only: {"tool": "<name>"}.\n\nTools:\n'
+    + "\n".join(f"- {n}: {t['function']['description']}" for n, t in TOOL_BY_NAME.items())
+)
+
+SYSTEM_PROMPT = f"""You are Free Rein, a coding agent running locally against project files.
 
 Project root: {BASE_DIR}
 You may only access files inside this root; anything outside it is unavailable to you.
 
-Tools available to you:
+Tools (a router picks the relevant one for each step, so you may only see one):
 - ReadFiles(fileName): read a file's full contents.
 - WriteInFiles(fileName, content): create or overwrite a file with the given content.
 - GetProjectContext(fileName?): see the project's directory tree, and optionally the
   sibling files around a given file, to orient yourself before reading/writing.
+- EditText(fileName, target, newText, mode): replace text, or insert before/after a
+  target string, in an existing file.
 
 Guidelines:
-- Call GetProjectContext first if you don't already know the project layout.
-- Read a file with ReadFiles before overwriting it with WriteInFiles, unless you are
-  intentionally creating a new file from scratch.
-- WriteInFiles overwrites the entire file. When editing an existing file, read it,
-  make your change in full, and write back the complete new content.
+- If a tool is provided, use it with correct arguments. If none is provided, answer directly.
+- WriteInFiles overwrites the entire file. For small changes prefer EditText.
 - Don't call a tool if you already have the information you need in the conversation.
 - Be direct and terse in your responses. Don't narrate every tool call in prose;
   just do the work and report the result.
@@ -292,9 +315,12 @@ def extract_tool_calls(chunk: Any) -> list[Any]:
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
-class Pulonia(App):
+class FreeRein(App):
     """Minimal Textual chat UI: centered hero (image + ascii + input) on landing,
     switches to full chat workspace once the first message is sent."""
+
+    TITLE = "Free Rein"
+    SUB_TITLE = "local coding agent"
 
     CSS = """
     Screen {
@@ -401,6 +427,7 @@ class Pulonia(App):
 
     COMMANDS = {
         "/model": "Switch or view Ollama models",
+        "/context": "Set/show context window (num_ctx)",
         "/clear": "Clear current chat history",
         "/session": "View cached chat sessions",
     }
@@ -408,6 +435,9 @@ class Pulonia(App):
     def __init__(self) -> None:
         super().__init__()
         self.model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+        self.nimble_model = os.getenv("NIMBLE_MODEL", "nimble")
+        self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "0")) or None  # 0 means use model default
+        self.num_predict = int(os.getenv("OLLAMA_NUM_PREDICT", "0")) or None
         self.messages: list[dict[str, Any]] = [
             {
                 "role": "system",
@@ -415,6 +445,7 @@ class Pulonia(App):
             }
         ]
         self._ollama = AsyncClient()
+        self._router_available: bool | None = None  # None = not checked yet
         self._messages_widget: RichLog | None = None
         self._stream_widget: Static | None = None
         self._input_widget: Input | None = None
@@ -422,6 +453,7 @@ class Pulonia(App):
         self._timer_widget: Static | None = None
         self._spinner_timer = None
         self._spinner_frame = 0
+        self._status_label = "thinking"
         self._request_start: float = 0.0
         self._has_started_chat = False
 
@@ -458,7 +490,7 @@ class Pulonia(App):
                 yield Static(f"[bold magenta]{BIG_ASCII}[/]", id="hero_fallback")
 
                 yield Input(
-                    placeholder="Ask Pulonia something or type / for commands...",
+                    placeholder="Ask Free Rein something or type / for commands...",
                     id="input",
                 )
 
@@ -487,9 +519,75 @@ class Pulonia(App):
         self._timer_widget = self.query_one("#timer", Static)
         self._input_widget.focus()
 
-        self._messages_widget.write(f"[bold cyan]Model:[/] {self.model}")
-        self._messages_widget.write(f"[bold cyan]Project root:[/] {BASE_DIR}")
+        self._write_header()
         self._update_ascii_art(self.size.width)
+        self.run_worker(self._ensure_router_model(), exclusive=False)
+
+    def _note(self, text: str) -> None:
+        if self._messages_widget is not None:
+            self._messages_widget.write(text)
+
+    async def _ensure_router_model(self) -> None:
+        """Make sure the router model (nimble/laya/...) is actually present in
+        Ollama before we rely on it every turn. Without this, a typo'd or
+        never-pulled NIMBLE_MODEL just fails silently on every request and we
+        quietly fall back to exposing all tools."""
+        try:
+            resp = await self._ollama.list()
+        except Exception as exc:
+            self._router_available = False
+            self._note(f"[bold yellow]router: couldn't reach ollama ({exc})[/]")
+            return
+
+        raw_models = resp.get("models") if isinstance(resp, dict) else getattr(resp, "models", [])
+        names = {
+            m.get("model") if isinstance(m, dict) else getattr(m, "model", None)
+            for m in raw_models
+        }
+        names.discard(None)
+        # local tags are usually reported as "name:latest" — match either form.
+        bare_names = {n.split(":")[0] for n in names}
+
+        if self.nimble_model in names or self.nimble_model in bare_names:
+            self._router_available = True
+            return
+
+        self._note(f"[dim]router model '{self.nimble_model}' not found locally, pulling...[/]")
+        try:
+            async for progress in await self._ollama.pull(model=self.nimble_model, stream=True):
+                status = (
+                    progress.get("status")
+                    if isinstance(progress, dict)
+                    else getattr(progress, "status", "")
+                )
+                if status:
+                    self._set_status(f"pulling {self.nimble_model}: {status}")
+            self._router_available = True
+            self._note(f"[bold green]router model '{self.nimble_model}' ready[/]")
+            self._set_status("Ready")
+        except Exception as exc:
+            self._router_available = False
+            self._note(
+                f"[bold red]couldn't download router model '{self.nimble_model}': {exc}[/]\n"
+                f"[dim]it isn't a pullable Ollama tag — create it locally, e.g. "
+                f"`ollama create {self.nimble_model} -f Modelfile`, or set "
+                "NIMBLE_MODEL to an existing model. Falling back to exposing all "
+                "tools to the main model.[/]"
+            )
+
+    def _write_header(self) -> None:
+        if self._messages_widget is None:
+            return
+        ctx = self.num_ctx if self.num_ctx is not None else "default"
+        router_status = {True: "ready", False: "unavailable", None: "checking..."}[
+            self._router_available
+        ]
+        self._messages_widget.write(f"[bold cyan]Model:[/] {self.model}")
+        self._messages_widget.write(
+            f"[bold cyan]Nimble:[/] {self.nimble_model} [dim]({router_status})[/]"
+        )
+        self._messages_widget.write(f"[bold cyan]Context:[/] num_ctx={ctx}")
+        self._messages_widget.write(f"[bold cyan]Project root:[/] {BASE_DIR}")
 
     def on_resize(self, event: Resize) -> None:
         """Dynamically adapts the ASCII banner according to terminal width."""
@@ -500,7 +598,6 @@ class Pulonia(App):
             fallback_widget = self.query_one("#hero_fallback", Static)
         except Exception:
             return
-
 
         fallback_widget.update(f"[bold magenta]{BIG_ASCII}[/]")
 
@@ -526,7 +623,7 @@ class Pulonia(App):
         self.messages = [self.messages[0]]
         if self._messages_widget is not None:
             self._messages_widget.clear()
-            self._messages_widget.write(f"[bold cyan]Model:[/] {self.model}")
+            self._write_header()
         if self._stream_widget is not None:
             self._stream_widget.update("")
         self._set_status("Ready")
@@ -537,13 +634,24 @@ class Pulonia(App):
         if self._status_widget is not None:
             self._status_widget.update(text)
 
-    def _tick_spinner(self, label: str = "thinking") -> None:
+    def _set_activity(self, text: str) -> None:
+        """Update what the spinner reports, while a turn is in flight.
+
+        _set_status() alone doesn't work here: the spinner's own 80ms tick
+        immediately overwrites the status bar with its hardcoded label, so any
+        plain _set_status() call made mid-turn (routing, streaming, running
+        tools, ...) was invisible for all but a few ms. The spinner now reads
+        this label on every tick instead of a fixed one.
+        """
+        self._status_label = text
+
+    def _tick_spinner(self) -> None:
         if self._status_widget is None:
             return
         frame = SPINNER_FRAMES[self._spinner_frame % len(SPINNER_FRAMES)]
         self._spinner_frame += 1
         elapsed = time.perf_counter() - self._request_start
-        self._status_widget.update(f"{frame} {label}...")
+        self._status_widget.update(f"{frame} {self._status_label}...")
         if self._timer_widget is not None:
             self._timer_widget.update(f"{elapsed:0.1f}s")
 
@@ -583,10 +691,10 @@ class Pulonia(App):
             elif event.key == "tab" or (
                 event.key == "enter" and autocomplete.highlighted is not None
             ):
-                if autocomplete.highlighted_at is not None:
-                    option = autocomplete.get_option_at_index(
-                        autocomplete.highlighted_at
-                    )
+                # OptionList exposes `highlighted` (an index); `highlighted_at`
+                # doesn't exist and raised AttributeError here.
+                if autocomplete.highlighted is not None:
+                    option = autocomplete.get_option_at_index(autocomplete.highlighted)
                     if option and option.id:
                         input_widget = self.query_one("#input", Input)
                         input_widget.value = f"{option.id} "
@@ -607,6 +715,7 @@ class Pulonia(App):
 
     def _start_spinner(self) -> None:
         self._spinner_frame = 0
+        self._status_label = "thinking"
         self._request_start = time.perf_counter()
         self._spinner_timer = self.set_interval(0.08, self._tick_spinner)
 
@@ -638,9 +747,54 @@ class Pulonia(App):
 
         if self._messages_widget:
             self._messages_widget.write(
-                f"[dim]→ {name}({args}) => {str(result)[:200]}[/]"
+                f"[dim]▸ {name}({args}) → {str(result)[:200]}[/]"
             )
         return {"role": "tool", "name": name, "content": str(result)}
+
+    async def _pick_tool(self, turn_start: int) -> str | None:
+        """Ask nimble which tool the next step needs.
+
+        Returns a tool name, "none" (answer directly), or None if nimble failed
+        (caller falls back to exposing every tool).
+        """
+        if self._router_available is False:
+            return None
+
+        request = str(self.messages[turn_start].get("content", ""))[:2000]
+        steps = [
+            f"- {m.get('name', '?')} -> {str(m.get('content', ''))[:200]}"
+            for m in self.messages[turn_start + 1 :]
+            if m.get("role") == "tool"
+        ]
+        done = "\n".join(steps) if steps else "(none yet)"
+        prompt = (
+            f"Request: {request}\n\n"
+            f"Tool results so far:\n{done}\n\n"
+            "Which tool is needed next?"
+        )
+
+        try:
+            resp = await self._ollama.chat(
+                model=self.nimble_model,
+                messages=[
+                    {"role": "system", "content": ROUTER_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                format=PICK_SCHEMA,
+                options={k: v for k, v in {
+                    "temperature": 0,
+                    "num_ctx": self.num_ctx,
+                    "num_predict": self.num_predict,
+                }.items() if v is not None},
+                stream=False,
+            )
+            tool = json.loads(extract_chunk_content(resp)).get("tool", "none")
+        except Exception as exc:
+            if self._messages_widget:
+                self._messages_widget.write(f"[bold yellow]nimble failed: {exc}[/]")
+            return None
+
+        return tool if tool in TOOL_BY_NAME or tool == "none" else None
 
     async def _handle_command(self, raw: str) -> None:
         parts = raw[1:].split(maxsplit=1)
@@ -649,6 +803,8 @@ class Pulonia(App):
 
         if cmd == "model":
             await self._cmd_model(arg)
+        elif cmd == "context" or cmd == "ctx":
+            self._cmd_context(arg)
         elif cmd == "clear":
             self.action_clear_chat()
         else:
@@ -683,10 +839,31 @@ class Pulonia(App):
             return
 
         if not arg:
-            lines = [
-                f"  [{i}] {n}" + ("  [dim](current)[/]" if n == self.model else "")
-                for i, n in enumerate(names)
-            ]
+            lines = []
+            for i, n in enumerate(names):
+                ctx_str = ""
+                # try to fetch details for context info (best effort, don't slow too much)
+                try:
+                    if hasattr(self._ollama, "show"):
+                        info = await self._ollama.show(n)
+                    else:
+                        info = None
+                    if info:
+                        # ollama.show returns dict-like
+                        details = info.get("model_info") if isinstance(info, dict) else getattr(info, "model_info", None) or info
+                        if isinstance(details, dict):
+                            # try common keys
+                            params = details.get("parameters") or details
+                            # look for num_ctx, context_length
+                            ctx = params.get("num_ctx") or params.get("context_length") or params.get("max_ctx")
+                            if not ctx:
+                                # check nested
+                                ctx = params.get("llama.context_length") or params.get("gpt2.context_length")
+                            if ctx:
+                                ctx_str = f"  [dim](ctx={ctx})[/]"
+                except Exception:
+                    ctx_str = ""
+                lines.append(f"  [{i}] {n}" + ("  [dim](current)[/]" if n == self.model else "") + ctx_str)
             if self._messages_widget:
                 self._messages_widget.write(
                     "[bold cyan]local models:[/]\n" + "\n".join(lines)
@@ -711,6 +888,50 @@ class Pulonia(App):
         if self._messages_widget:
             self._messages_widget.write(f"[bold green]switched model →[/] {picked}")
 
+    def _cmd_context(self, arg: str) -> None:
+        if not arg:
+            ctx = self.num_ctx if self.num_ctx is not None else "default"
+            pred = self.num_predict if self.num_predict is not None else "default"
+            if self._messages_widget:
+                self._messages_widget.write(
+                    f"[bold cyan]Context:[/] num_ctx={ctx} (tokens), num_predict={pred} (max output)"
+                )
+            return
+        try:
+            # try to parse like "4096" or "num_ctx=4096,num_predict=256"
+            if "=" in arg:
+                parts = arg.split(",")
+                for p in parts:
+                    k, v = p.split("=", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if k in ("num_ctx", "context", "ctx"):
+                        self.num_ctx = int(v) if v else None
+                        if self.num_ctx == 0:
+                            self.num_ctx = None
+                    if k in ("num_predict", "max_tokens", "max_new_tokens", "output"):
+                        self.num_predict = int(v) if v else None
+                        if self.num_predict == 0:
+                            self.num_predict = None
+            else:
+                # just a number - set num_ctx
+                val = int(arg.strip())
+                if val <= 0:
+                    self.num_ctx = None
+                else:
+                    self.num_ctx = val
+            if self._messages_widget:
+                ctx = self.num_ctx if self.num_ctx is not None else "default"
+                pred = self.num_predict if self.num_predict is not None else "default"
+                self._messages_widget.write(
+                    f"[bold green]context set →[/] num_ctx={ctx}, num_predict={pred}"
+                )
+        except ValueError:
+            if self._messages_widget:
+                self._messages_widget.write(
+                    f"[bold red]invalid context format:[/] '{arg}' (use e.g. 4096 or num_ctx=4096,num_predict=256)"
+                )
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
         if not prompt:
@@ -732,20 +953,42 @@ class Pulonia(App):
         self._input_widget.disabled = True
         self._messages_widget.write(f"\n[bold green]You:[/] {prompt}")
         self.messages.append({"role": "user", "content": prompt})
+        turn_start = len(self.messages) - 1  # index of this request's user message
 
         self._start_spinner()
+        self._stream_widget.update("[dim]thinking...[/]")
 
         try:
             for turn in range(MAX_TOOL_TURNS):
-                self._stream_widget.update("[bold magenta]Pulonia:[/] ")
+                # 1. nimble picks the tool for this step — routing chatter goes to
+                # the status bar, not the chat log, so the transcript stays
+                # conversation-only.
+                picked = await self._pick_tool(turn_start)
+                if picked is None:
+                    tools = TOOLS  # nimble unavailable: old behaviour
+                    self._set_activity("routing: fallback (all tools)")
+                elif picked == "none":
+                    tools = None
+                    self._set_activity("routing: none (direct answer)")
+                else:
+                    tools = [TOOL_BY_NAME[picked]]
+                    self._set_activity(f"routing → {picked}")
+
+                # 2. main model sees only that tool
+                self._stream_widget.update("[bold magenta]Free Rein:[/] ")
                 chunks: list[str] = []
                 pending_tool_calls: list[Any] = []
 
+                options = {k: v for k, v in {
+                    "num_ctx": self.num_ctx,
+                    "num_predict": self.num_predict,
+                }.items() if v is not None}
                 stream = await self._ollama.chat(
                     model=self.model,
                     messages=self.messages,
-                    tools=TOOLS,
+                    tools=tools,
                     stream=True,
+                    options=options if options else None,
                 )
 
                 first_token = True
@@ -754,10 +997,10 @@ class Pulonia(App):
                     if content:
                         if first_token:
                             first_token = False
-                            self._set_status("streaming...")
+                            self._set_activity("streaming")
                         chunks.append(content)
                         self._stream_widget.update(
-                            "[bold magenta]Pulonia:[/] " + "".join(chunks)
+                            "[bold magenta]Free Rein:[/] " + "".join(chunks)
                         )
 
                     tool_calls = extract_tool_calls(chunk)
@@ -766,6 +1009,7 @@ class Pulonia(App):
 
                 answer = "".join(chunks).strip()
 
+                # 3. dispatch, feed results back, loop so nimble can pick again
                 if pending_tool_calls:
                     self.messages.append(
                         {
@@ -774,7 +1018,7 @@ class Pulonia(App):
                             "tool_calls": pending_tool_calls,
                         }
                     )
-                    self._set_status(f"running {len(pending_tool_calls)} tool(s)...")
+                    self._set_activity(f"running {len(pending_tool_calls)} tool(s)")
                     for tool_call in pending_tool_calls:
                         self.messages.append(self._run_tool_call(tool_call))
                     continue
@@ -788,11 +1032,14 @@ class Pulonia(App):
                 )
 
         except Exception as exc:
-            self._stream_widget.update(f"[bold red]Pulonia: error:[/] {exc}")
+            self._stream_widget.update(f"[bold red]Free Rein: error:[/] {exc}")
             self._set_status("error")
         else:
             elapsed = time.perf_counter() - self._request_start
             self._set_status("Ready")
+            # The final answer already landed in the Chat log above; clear Live
+            # so it doesn't keep showing a stale duplicate of it.
+            self._stream_widget.update("[dim]— waiting for next message —[/]")
             if self._timer_widget is not None:
                 self._timer_widget.update(f"responded in {elapsed:0.2f}s")
         finally:
@@ -802,4 +1049,4 @@ class Pulonia(App):
 
 
 if __name__ == "__main__":
-    Pulonia().run()
+    FreeRein().run()

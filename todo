@@ -1,0 +1,4 @@
+[x] enforce nimble download if we're using nimble as the decision maker
+[] If it comes to making a decision i'm gonna use laya and finetune it for tool picking
+[x] rename Pulonia -> Free Rein
+[x] clean up the UI (status bar bug, decluttered chat log, idle Live panel)
